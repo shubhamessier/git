@@ -1,4 +1,5 @@
 #include "../git-compat-util.h"
+#include "../abspath.h"
 #include "../copy.h"
 #include "../environment.h"
 #include "../gettext.h"
@@ -560,7 +561,7 @@ stat_ref:
 	buf = sb_contents.buf;
 
 	ret = parse_loose_ref_contents(ref_store->repo->hash_algo, buf,
-				       oid, referent, type, &myerr);
+				       oid, referent, type, NULL, &myerr);
 
 out:
 	if (ret && !myerr)
@@ -597,7 +598,7 @@ static int files_read_symbolic_ref(struct ref_store *ref_store, const char *refn
 int parse_loose_ref_contents(const struct git_hash_algo *algop,
 			     const char *buf, struct object_id *oid,
 			     struct strbuf *referent, unsigned int *type,
-			     int *failure_errno)
+			     const char **trailing, int *failure_errno)
 {
 	const char *p;
 	if (skip_prefix(buf, "ref:", &buf)) {
@@ -619,6 +620,10 @@ int parse_loose_ref_contents(const struct git_hash_algo *algop,
 		*failure_errno = EINVAL;
 		return -1;
 	}
+
+	if (trailing)
+		*trailing = p;
+
 	return 0;
 }
 
@@ -1946,10 +1951,13 @@ static int commit_ref_update(struct files_ref_store *refs,
 	return 0;
 }
 
+#ifdef NO_SYMLINK_HEAD
+#define create_ref_symlink(a, b) (-1)
+#else
 static int create_ref_symlink(struct ref_lock *lock, const char *target)
 {
 	int ret = -1;
-#ifndef NO_SYMLINK_HEAD
+
 	char *ref_path = get_locked_file_path(&lock->lk);
 	unlink(ref_path);
 	ret = symlink(target, ref_path);
@@ -1957,9 +1965,9 @@ static int create_ref_symlink(struct ref_lock *lock, const char *target)
 
 	if (ret)
 		fprintf(stderr, "no symlink - falling back to symbolic ref\n");
-#endif
 	return ret;
 }
+#endif
 
 static int create_symref_lock(struct ref_lock *lock, const char *target,
 			      struct strbuf *err)
@@ -3428,6 +3436,172 @@ typedef int (*files_fsck_refs_fn)(struct ref_store *ref_store,
 				  const char *refs_check_dir,
 				  struct dir_iterator *iter);
 
+/*
+ * Check the symref "pointee_name" and "pointee_path". The caller should
+ * make sure that "pointee_path" is absolute. For symbolic ref, "pointee_name"
+ * would be the content after "refs:". For symblic link, "pointee_name" would
+ * be the relative path agaignst "gitdir".
+ */
+static int files_fsck_symref_target(struct fsck_options *o,
+				    struct fsck_ref_report *report,
+				    struct strbuf *pointee_name,
+				    struct strbuf *pointee_path,
+				    unsigned int symbolic_link)
+{
+	const char *newline_pos = NULL;
+	const char *p = NULL;
+	struct stat st;
+	int ret = 0;
+
+	if (!skip_prefix(pointee_name->buf, "refs/", &p)) {
+
+		ret = fsck_report_ref(o, report,
+				      FSCK_MSG_BAD_SYMREF_POINTEE,
+				      "points to ref outside the refs directory");
+		goto out;
+	}
+
+	if (!symbolic_link) {
+		newline_pos = strrchr(p, '\n');
+		if (!newline_pos || *(newline_pos + 1)) {
+			ret = fsck_report_ref(o, report,
+					      FSCK_MSG_REF_MISSING_NEWLINE,
+					      "missing newline");
+		}
+	}
+
+	if (check_refname_format(pointee_name->buf, 0)) {
+		if (!symbolic_link) {
+			/*
+			* When containing null-garbage, "check_refname_format" will
+			* fail, we should trim the "pointee" to check again.
+			*/
+			strbuf_rtrim(pointee_name);
+			if (!check_refname_format(pointee_name->buf, 0)) {
+				ret = fsck_report_ref(o, report,
+						      FSCK_MSG_TRAILING_REF_CONTENT,
+						      "trailing null-garbage");
+				goto out;
+			}
+		}
+
+		ret = fsck_report_ref(o, report,
+				      FSCK_MSG_BAD_SYMREF_POINTEE,
+				      "points to refname with invalid format");
+	}
+
+	/*
+	 * Missing target should not be treated as any error worthy event and
+	 * not even warn. It is a common case that a symbolic ref points to a
+	 * ref that does not exist yet. If the target ref does not exist, just
+	 * skip the check for the file type.
+	 */
+	if (lstat(pointee_path->buf, &st) < 0)
+		goto out;
+
+	if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) {
+		ret = fsck_report_ref(o, report,
+				      FSCK_MSG_BAD_SYMREF_POINTEE,
+				      "points to an invalid file type");
+		goto out;
+	}
+
+out:
+	return ret;
+}
+
+static int files_fsck_refs_content(struct ref_store *ref_store,
+				   struct fsck_options *o,
+				   const char *refs_check_dir,
+				   struct dir_iterator *iter)
+{
+	struct strbuf pointee_path = STRBUF_INIT;
+	struct strbuf ref_content = STRBUF_INIT;
+	struct strbuf abs_gitdir = STRBUF_INIT;
+	struct strbuf referent = STRBUF_INIT;
+	struct strbuf refname = STRBUF_INIT;
+	struct fsck_ref_report report = {0};
+	const char *pointee_name = NULL;
+	unsigned int symbolic_link = 0;
+	const char *trailing = NULL;
+	unsigned int type = 0;
+	int failure_errno = 0;
+	struct object_id oid;
+	int ret = 0;
+
+	strbuf_addf(&refname, "%s/%s", refs_check_dir, iter->relative_path);
+	report.path = refname.buf;
+
+	if (S_ISREG(iter->st.st_mode)) {
+		if (strbuf_read_file(&ref_content, iter->path.buf, 0) < 0) {
+			ret = error_errno(_("%s/%s: unable to read the ref"),
+					  refs_check_dir, iter->relative_path);
+			goto cleanup;
+		}
+
+		if (parse_loose_ref_contents(ref_store->repo->hash_algo,
+					     ref_content.buf, &oid, &referent,
+					     &type, &trailing, &failure_errno)) {
+			ret = fsck_report_ref(o, &report,
+					      FSCK_MSG_BAD_REF_CONTENT,
+					      "invalid ref content");
+			goto cleanup;
+		}
+
+		if (!(type & REF_ISSYMREF)) {
+			if (*trailing == '\0') {
+				ret = fsck_report_ref(o, &report,
+						      FSCK_MSG_REF_MISSING_NEWLINE,
+						      "missing newline");
+				goto cleanup;
+			}
+
+			if (*trailing != '\n' || (*(trailing + 1) != '\0')) {
+				ret = fsck_report_ref(o, &report,
+						      FSCK_MSG_TRAILING_REF_CONTENT,
+						      "trailing garbage in ref");
+				goto cleanup;
+			}
+		} else {
+			strbuf_addf(&pointee_path, "%s/%s",
+				    ref_store->gitdir, referent.buf);
+			ret = files_fsck_symref_target(o, &report,
+						       &referent,
+						       &pointee_path,
+						       symbolic_link);
+		}
+		goto cleanup;
+	}
+
+	symbolic_link = 1;
+
+	strbuf_add_real_path(&pointee_path, iter->path.buf);
+	strbuf_add_absolute_path(&abs_gitdir, ref_store->gitdir);
+	strbuf_normalize_path(&abs_gitdir);
+	if (!is_dir_sep(abs_gitdir.buf[abs_gitdir.len - 1]))
+		strbuf_addch(&abs_gitdir, '/');
+
+	if (!skip_prefix(pointee_path.buf, abs_gitdir.buf, &pointee_name)) {
+		ret = fsck_report_ref(o, &report,
+				      FSCK_MSG_BAD_SYMREF_POINTEE,
+				      "point to target outside gitdir");
+		goto cleanup;
+	}
+
+	strbuf_addstr(&referent, pointee_name);
+	ret = files_fsck_symref_target(o, &report,
+				       &referent, &pointee_path,
+				       symbolic_link);
+
+cleanup:
+	strbuf_release(&refname);
+	strbuf_release(&ref_content);
+	strbuf_release(&referent);
+	strbuf_release(&pointee_path);
+	strbuf_release(&abs_gitdir);
+	return ret;
+}
+
 static int files_fsck_refs_name(struct ref_store *ref_store UNUSED,
 				struct fsck_options *o,
 				const char *refs_check_dir,
@@ -3444,7 +3618,7 @@ static int files_fsck_refs_name(struct ref_store *ref_store UNUSED,
 		goto cleanup;
 
 	if (check_refname_format(iter->basename, REFNAME_ALLOW_ONELEVEL)) {
-		struct fsck_ref_report report = { .path = NULL };
+		struct fsck_ref_report report = {0};
 
 		strbuf_addf(&sb, "%s/%s", refs_check_dir, iter->relative_path);
 		report.path = sb.buf;
@@ -3510,6 +3684,7 @@ static int files_fsck_refs(struct ref_store *ref_store,
 {
 	files_fsck_refs_fn fsck_refs_fn[]= {
 		files_fsck_refs_name,
+		files_fsck_refs_content,
 		NULL,
 	};
 
